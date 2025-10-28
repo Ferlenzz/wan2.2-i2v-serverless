@@ -1,3 +1,4 @@
+
 import os, io, base64
 from typing import Any, Dict
 
@@ -20,22 +21,21 @@ if not hasattr(nn, "RMSNorm"):
 # ---- SDPA shim: remove unknown kw and accept both positional/keyword qkv ----
 _SDPA_ORIG = F.scaled_dot_product_attention
 def _sdpa_patched(*args, **kwargs):
-    # torch <2.3 doesn't know this kw; torch >=2.3 treats it как опциональный
+    # torch <2.3 doesn't know this kw; torch >=2.3 treats it as optional
     kwargs.pop("enable_gqa", None)
     if len(args) >= 3:
         return _SDPA_ORIG(*args, **kwargs)
-    # поддержка вызовов через именованные аргументы
+    # support calls via keyword arguments
     q = kwargs.pop("q", kwargs.pop("query", None))
     k = kwargs.pop("k", kwargs.pop("key", None))
     v = kwargs.pop("v", kwargs.pop("value", None))
     if q is None or k is None or v is None:
-        # на всякий случай — передадим как есть
         return _SDPA_ORIG(*args, **kwargs)
     return _SDPA_ORIG(q, k, v, **kwargs)
 F.scaled_dot_product_attention = _sdpa_patched
 
 from PIL import Image
-# I2V доступен не во всех билдах — пробуем, иначе только T2V
+# Try I2V first (not available in all builds)
 try:
     from diffusers import WanI2VPipeline as _I2VCls
 except Exception:
@@ -49,7 +49,16 @@ os.environ['HF_HOME'] = HF_HOME
 
 MODEL_DIR = os.environ.get('WAN_MODEL_DIR', '/runpod-volume/models/Wan2.2-TI2V-5B-Diffusers')
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-DTYPE  = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+# dtype control (bf16 by default; allow override)
+_DTYPE_ENV = os.environ.get('WAN_DTYPE', '').lower()
+if _DTYPE_ENV in ('fp16','float16','half'):
+    DTYPE = torch.float16
+elif _DTYPE_ENV in ('fp32','float32'):
+    DTYPE = torch.float32
+else:
+    # good default on Ampere+
+    DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 DEF_FPS    = int(os.environ.get('WAN_FPS', '24'))
 DEF_FRAMES = int(os.environ.get('WAN_FRAMES', '121'))
@@ -59,6 +68,41 @@ DEF_CFG    = float(os.environ.get('WAN_CFG', '5.0'))
 _T2V = None
 _I2V = None
 
+def _apply_memory_opts(pipe):
+    """
+    Enable memory-saving features; controlled via env when relevant.
+    """
+    # attention/vae slicing are lightweight and help on 16–24GB cards
+    try:
+        pipe.enable_attention_slicing("max")
+    except Exception:
+        pass
+    try:
+        pipe.enable_vae_slicing()
+    except Exception:
+        pass
+    # VAE tiling helps for larger widths/heights
+    try:
+        pipe.vae.enable_tiling()
+    except Exception:
+        pass
+
+    # Optional CPU offload (slower but big VRAM saver)
+    if os.environ.get("WAN_CPU_OFFLOAD","0") == "1" and torch.cuda.is_available():
+        try:
+            pipe.enable_model_cpu_offload()
+            return pipe
+        except Exception:
+            # fallback to .to(DEVICE) if not available
+            pass
+
+    # default path: keep on GPU
+    try:
+        pipe.to(DEVICE)
+    except Exception:
+        pass
+    return pipe
+
 def _load_t2v():
     global _T2V
     if _T2V is not None:
@@ -66,7 +110,8 @@ def _load_t2v():
     if not os.path.isdir(MODEL_DIR):
         raise RuntimeError(f'WAN_MODEL_DIR not found: {MODEL_DIR}')
     vae = AutoencoderKLWan.from_pretrained(MODEL_DIR, subfolder='vae', torch_dtype=torch.float32)
-    pipe = _T2VCls.from_pretrained(MODEL_DIR, vae=vae, torch_dtype=DTYPE).to(DEVICE)
+    pipe = _T2VCls.from_pretrained(MODEL_DIR, vae=vae, torch_dtype=DTYPE)
+    pipe = _apply_memory_opts(pipe)
     _T2V = pipe
     return _T2V
 
@@ -79,7 +124,8 @@ def _load_i2v():
     if not os.path.isdir(MODEL_DIR):
         raise RuntimeError(f'WAN_MODEL_DIR not found: {MODEL_DIR}')
     vae = AutoencoderKLWan.from_pretrained(MODEL_DIR, subfolder='vae', torch_dtype=torch.float32)
-    pipe = _I2VCls.from_pretrained(MODEL_DIR, vae=vae, torch_dtype=DTYPE).to(DEVICE)
+    pipe = _I2VCls.from_pretrained(MODEL_DIR, vae=vae, torch_dtype=DTYPE)
+    pipe = _apply_memory_opts(pipe)
     _I2V = pipe
     return _I2V
 
@@ -104,6 +150,10 @@ def handler(event: Dict[str, Any]):
         img_b64 = inp.get('image_base64')
         ret_b64 = bool(inp.get('return_video_b64', True))
 
+        # Round dims to multiples of 8 to avoid shape/tiling overhead
+        width  = int(width // 8 * 8)
+        height = int(height // 8 * 8)
+
         use_i2v = bool(img_b64)
         pipe = _load_i2v() if use_i2v else _load_t2v()
         if pipe is None:
@@ -121,11 +171,19 @@ def handler(event: Dict[str, Any]):
 
         if use_i2v and img_b64:
             pil = _b64_to_pil(img_b64)
-            # наиболее типичное имя параметра для I2V
-            if "image" in getattr(pipe.__call__, "__code__", type("x",(object,),{})()).co_varnames:
+            # match param name supported by current pipeline
+            call_vars = getattr(pipe.__call__, "__code__", None)
+            names = call_vars.co_varnames if call_vars else ()
+            if "image" in names:
                 kwargs["image"] = pil
-            else:
+            elif "img" in names:
                 kwargs["img"] = pil
+            else:
+                kwargs["image"] = pil  # fallback
+
+        # help allocator after multiple runs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         with torch.inference_mode():
             result = pipe(**kwargs)
@@ -140,7 +198,8 @@ def handler(event: Dict[str, Any]):
             'meta': {
                 'mode': 'i2v' if use_i2v else 't2v',
                 'width': width, 'height': height, 'frames': frames,
-                'fps': fps, 'steps': steps, 'cfg': cfg, 'prompt': prompt
+                'fps': fps, 'steps': steps, 'cfg': cfg, 'prompt': prompt,
+                'dtype': str(DTYPE), 'cpu_offload': os.environ.get("WAN_CPU_OFFLOAD","0")
             }
         }
         if ret_b64:

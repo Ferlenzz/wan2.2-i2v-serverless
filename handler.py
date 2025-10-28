@@ -17,17 +17,25 @@ if not hasattr(nn, "RMSNorm"):
             return self.weight * (x * rms)
     nn.RMSNorm = _RMSNorm
 
-# ---- SDPA shim: ALWAYS remove unknown kw ----
+# ---- SDPA shim: remove unknown kw and accept both positional/keyword qkv ----
 _SDPA_ORIG = F.scaled_dot_product_attention
-def _sdpa_patched(q, k, v, *args, **kwargs):
-    # torch <2.3 doesn't know this kw; torch >=2.3 treats it as optional
+def _sdpa_patched(*args, **kwargs):
+    # torch <2.3 doesn't know this kw; torch >=2.3 treats it как опциональный
     kwargs.pop("enable_gqa", None)
-    return _SDPA_ORIG(q, k, v, *args, **kwargs)
+    if len(args) >= 3:
+        return _SDPA_ORIG(*args, **kwargs)
+    # поддержка вызовов через именованные аргументы
+    q = kwargs.pop("q", kwargs.pop("query", None))
+    k = kwargs.pop("k", kwargs.pop("key", None))
+    v = kwargs.pop("v", kwargs.pop("value", None))
+    if q is None or k is None or v is None:
+        # на всякий случай — передадим как есть
+        return _SDPA_ORIG(*args, **kwargs)
+    return _SDPA_ORIG(q, k, v, **kwargs)
 F.scaled_dot_product_attention = _sdpa_patched
 
 from PIL import Image
-
-# Try I2V first, else fall back to T2V
+# I2V доступен не во всех билдах — пробуем, иначе только T2V
 try:
     from diffusers import WanI2VPipeline as _I2VCls
 except Exception:
@@ -114,10 +122,9 @@ def handler(event: Dict[str, Any]):
         if use_i2v and img_b64:
             pil = _b64_to_pil(img_b64)
             # наиболее типичное имя параметра для I2V
-            if "image" in pipe.__call__.__code__.co_varnames:
+            if "image" in getattr(pipe.__call__, "__code__", type("x",(object,),{})()).co_varnames:
                 kwargs["image"] = pil
             else:
-                # запасной ключ
                 kwargs["img"] = pil
 
         with torch.inference_mode():

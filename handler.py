@@ -1,169 +1,106 @@
-# handler.py
-import base64, io, os, json
+import os
+import io
+import base64
 from typing import Any, Dict
 
-import runpod
+import torch
 from PIL import Image
+from diffusers import WanPipeline, AutoencoderKLWan
+from diffusers.utils import export_to_video
 
-# ------------------ CONFIG ------------------
-# Кэш HF на томе (Runpod Network Volume)
-HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/hf_cache")
-os.environ["HF_HOME"] = HF_HOME
+# ---------- ENV ----------
+HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/cache/hf")
 os.makedirs(HF_HOME, exist_ok=True)
+os.environ["HF_HOME"] = HF_HOME
 
-# Где лежат веса Wan (на томе)
-WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/runpod-volume/wan_ckpt")
+MODEL_DIR = os.environ.get("WAN_MODEL_DIR", "/runpod-volume/models/Wan2.2-TI2V-5B-Diffusers")
+DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Эконом-профиль по умолчанию
-DEF_W, DEF_H = 384, 384
-DEF_FRAMES   = int(os.environ.get("WAN_FORCE_FRAMES", "12") or "12")
-DEF_STEPS    = 8
-DEF_FPS      = 12
-DEF_CFG      = 2.0
+DEF_FPS    = int(os.environ.get("WAN_FPS", "24"))
+DEF_FRAMES = int(os.environ.get("WAN_FRAMES", "121"))  # ~5с @ 24fps
+DEF_STEPS  = int(os.environ.get("WAN_STEPS", "30"))
+DEF_CFG    = float(os.environ.get("WAN_CFG", "5.0"))
 
-# ------------------ MODEL SINGLETON ------------------
-_WAN = None
-def load_model():
-    """
-    Ожидаем, что официальная библиотека Wan2.2 установлена в образе.
-    Веса (UNet/VAE/токенайзер и пр.) — на томе WAN_CKPT_DIR.
-    """
-    global _WAN
-    if _WAN is not None:
-        return _WAN
+# ---------- SINGLETON PIPE ----------
+_PIPE = None
 
-    # Импортируем «ванильный» Wan2.2
-    from wan.image2video import WanI2V  # из официального репозитория Wan 2.2
+def _load_pipe():
+    global _PIPE
+    if _PIPE is not None:
+        return _PIPE
+    if not os.path.isdir(MODEL_DIR):
+        raise RuntimeError(f"WAN_MODEL_DIR not found: {MODEL_DIR}")
+    # vae отдельно (как советует карточка модели)
+    vae = AutoencoderKLWan.from_pretrained(MODEL_DIR, subfolder="vae", torch_dtype=torch.float32)
+    pipe = WanPipeline.from_pretrained(MODEL_DIR, vae=vae, torch_dtype=DTYPE)
+    pipe.to(DEVICE)
+    _PIPE = pipe
+    return _PIPE
 
-    # Инициализация модели один раз на процесс
-    # Если у WanI2V иные параметры, см. их README; обычно достаточно указать путь к чекпоинтам.
-    _WAN = WanI2V(ckpt_dir=WAN_CKPT_DIR)
-    return _WAN
+# ---------- UTILS ----------
+def _b64_to_pil(b64: str) -> Image.Image:
+    data = base64.b64decode(b64)
+    return Image.open(io.BytesIO(data)).convert("RGB")
 
-# ------------------ UTILS ------------------
-def decode_image_b64(b64: str) -> Image.Image:
-    raw = base64.b64decode(b64)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
+def _file_to_b64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-def encode_video_mp4_from_frames(frames, fps=DEF_FPS) -> bytes:
-    """
-    Кодируем список кадров (numpy HxWx3, uint8) в MP4 (libx264, yuv420p).
-    Требуется imageio-ffmpeg (есть в requirements) и ffmpeg в системе.
-    """
-    import imageio
-    with io.BytesIO() as buf:
-        writer = imageio.get_writer(
-            buf, format="ffmpeg", mode="I",
-            fps=int(fps), codec="libx264", pixelformat="yuv420p"
-        )
-        for fr in frames:
-            writer.append_data(fr)
-        writer.close()
-        return buf.getvalue()
-
-def try_generate(model, **kw):
-    """
-    Универсальный вызов: у некоторых версий WanI2V ключ 'image',
-    у других — 'img'/'x'. Пробуем несколько вариантов.
-    """
-    import numpy as np
-
-    def pil_to_np(img: Image.Image):
-        import numpy as _np
-        return _np.array(img).astype("uint8")
-
-    image = kw.pop("image", None)
-    if image is None:
-        raise ValueError("image is required")
-
-    # Пробуем разные имена параметров
-    for key in ("image", "img", "x"):
-        try:
-            out = model.generate(**{key: image}, **kw)
-            # Приводим результат к списку кадров (numpy HxWx3)
-            if isinstance(out, list) and len(out) and hasattr(out[0], "shape"):
-                return out
-            # Если вернулся PIL или np.array одного кадра — оборачиваем
-            if hasattr(out, "shape"):
-                return [out]
-            if isinstance(out, Image.Image):
-                return [pil_to_np(out)]
-        except TypeError:
-            continue
-    # Если объект модели callable:
-    try:
-        out = model(image, **kw)
-        if isinstance(out, list) and len(out) and hasattr(out[0], "shape"):
-            return out
-    except Exception as e:
-        raise e
-    raise RuntimeError("WanI2V.generate() did not return frames")
-
-# ------------------ HANDLER ------------------
+# ---------- HANDLER ----------
 def handler(event: Dict[str, Any]):
     """
-    Ожидаем payload:
-    {
-      "input": {
-        "action": "gen",
-        "user_id": "u1",
-        "image_base64": "...",
-        "prompt": "cat jumps",
-        "width": 384, "height": 384,
-        "length": 12, "fps": 12,
-        "steps": 8, "cfg": 2.0,
-        "return_video_b64": true
-      }
-    }
+    input:
+      prompt: str (optional)
+      image_base64: str (optional; если есть — I2V, если нет — T2V)
+      width, height: int
+      length: int (num_frames)
+      fps: int
+      steps: int (diffusion steps)
+      cfg: float (guidance_scale)
     """
-    inp = (event or {}).get("input") or {}
-    if inp.get("action") != "gen":
-        return {"error": "unsupported action"}
+    try:
+        inp = (event or {}).get("input") or {}
+        prompt = inp.get("prompt", "")
+        width  = int(inp.get("width",  1280))
+        height = int(inp.get("height",  704))
+        frames = int(inp.get("length",  DEF_FRAMES))
+        fps    = int(inp.get("fps",     DEF_FPS))
+        steps  = int(inp.get("steps",   DEF_STEPS))
+        cfg    = float(inp.get("cfg",   DEF_CFG))
+        img_b64 = inp.get("image_base64")
 
-    # Параметры генерации
-    width   = int(inp.get("width",  DEF_W))
-    height  = int(inp.get("height", DEF_H))
-    length  = int(inp.get("length", DEF_FRAMES))
-    fps     = int(inp.get("fps",    DEF_FPS))
-    steps   = int(inp.get("steps",  DEF_STEPS))
-    cfg     = float(inp.get("cfg",  DEF_CFG))
-    prompt  = inp.get("prompt", "")
+        pipe = _load_pipe()
 
-    # Входная картинка
-    b64 = inp.get("image_base64")
-    if not b64:
-        return {"error": "image_base64 required"}
-    img = decode_image_b64(b64).resize((width, height), Image.BICUBIC)
+        kwargs = dict(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_frames=frames,
+            guidance_scale=cfg,
+            num_inference_steps=steps,
+        )
 
-    # Модель
-    model = load_model()
+        if img_b64:
+            pil = _b64_to_pil(img_b64)
+            kwargs["image"] = pil  # I2V
+        # иначе чистый T2V по prompt
 
-    # Генерация (официальный Wan2.2)
-    # Большинство сборок WanI2V ожидает PIL.Image / np.array и такие ключи:
-    # width/height/length/fps/steps/cfg/prompt
-    frames = try_generate(
-        model,
-        image=img,
-        prompt=prompt,
-        width=width,
-        height=height,
-        length=length,  # число кадров
-        fps=fps,
-        steps=steps,
-        cfg=cfg,
-    )
+        with torch.inference_mode():
+            result = pipe(**kwargs)
+            frames_list = result.frames[0]  # list[np.ndarray(H,W,3)]
 
-    # Кодирование MP4
-    mp4_bytes = encode_video_mp4_from_frames(frames, fps=fps)
-    video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
+        os.makedirs("/tmp/out", exist_ok=True)
+        out_path = "/tmp/out/wan_out.mp4"
+        export_to_video(frames_list, out_path, fps=fps)
 
-    return {
-        "video_b64": video_b64,
-        "meta": {
-            "width": width, "height": height, "length": length, "fps": fps, "steps": steps, "cfg": cfg,
-            "prompt": prompt
+        return {
+            "ok": True,
+            "meta": {
+                "width": width, "height": height, "frames": frames,
+                "fps": fps, "steps": steps, "cfg": cfg, "prompt": prompt
+            },
+            "video_b64": _file_to_b64(out_path)
         }
-    }
-
-runpod.serverless.start({"handler": handler})
-
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}

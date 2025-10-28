@@ -11,6 +11,17 @@ for k in ("HF_HOME","WAN_MODEL_DIR","HF_HUB_ENABLE_HF_TRANSFER",
     if v: print(f"[env] {k}={v}")
 PY
 
+# -----------------------------------------------------------------------------
+# Зависимости для токенизации текста (ftfy) — нужна CLIP'у/токенайзеру
+# -----------------------------------------------------------------------------
+${PYBIN} - <<'PY_FTFY'
+import sys, subprocess
+def pip(*a): subprocess.check_call([sys.executable, "-m", "pip", *a])
+pip("install", "-q", "--no-cache-dir", "ftfy>=6.1.1", "regex>=2023.0.0")
+print("[deps] ftfy installed/ok")
+PY_FTFY
+
+
 # Запускаем runpod handler
 python3 - <<'PY'
 import runpod, handler

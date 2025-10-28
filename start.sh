@@ -12,7 +12,7 @@ for k in ("HF_HOME","WAN_MODEL_DIR","HF_HUB_ENABLE_HF_TRANSFER","TMPDIR","PIP_CA
     if v: print(f"[env] {k}={v}")
 PY
 
-# блок с ftfy
+# блок с ftfy (для токенизации текста)
 ${PYBIN} - <<'PY_FTFY'
 import sys, subprocess
 subprocess.check_call([sys.executable,"-m","pip","install","-q","--no-cache-dir","ftfy>=6.1.1","regex>=2023.0.0"])

@@ -17,6 +17,18 @@ if not hasattr(nn, "RMSNorm"):
     nn.RMSNorm = _RMSNorm
 # ------------------------------------------------------------------------
 
+# ---- SDPA shim: игнорируем enable_gqa для старых версий torch ----
+import inspect
+import torch.nn.functional as F
+
+if "enable_gqa" not in inspect.signature(F.scaled_dot_product_attention).parameters:
+    _sdpa_orig = F.scaled_dot_product_attention
+    def _sdpa_patched(q, k, v, *args, **kwargs):
+        kwargs.pop("enable_gqa", None)
+        return _sdpa_orig(q, k, v, *args, **kwargs)
+    F.scaled_dot_product_attention = _sdpa_patched
+# ------------------------------------------------------------------
+
 from PIL import Image
 
 # Импорты diffusers после шима

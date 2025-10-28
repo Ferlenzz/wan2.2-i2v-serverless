@@ -1,4 +1,3 @@
-
 import os, io, base64
 from typing import Any, Dict
 
@@ -6,7 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---- RMSNorm shim ----
+# Fast+stable defaults
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# ---- RMSNorm shim (older torch) ----
 if not hasattr(nn, "RMSNorm"):
     class _RMSNorm(nn.Module):
         def __init__(self, dim: int, eps: float = 1e-6):
@@ -17,15 +19,12 @@ if not hasattr(nn, "RMSNorm"):
             rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
             return self.weight * (x * rms)
     nn.RMSNorm = _RMSNorm
-
-# ---- SDPA shim: remove unknown kw and accept both positional/keyword qkv ----
+# ---- SDPA shim: drop unknown kwargs and accept q/k/v via keywords ----
 _SDPA_ORIG = F.scaled_dot_product_attention
 def _sdpa_patched(*args, **kwargs):
-    # torch <2.3 doesn't know this kw; torch >=2.3 treats it as optional
-    kwargs.pop("enable_gqa", None)
+    kwargs.pop("enable_gqa", None)  # older torch doesn't know this kw
     if len(args) >= 3:
         return _SDPA_ORIG(*args, **kwargs)
-    # support calls via keyword arguments
     q = kwargs.pop("q", kwargs.pop("query", None))
     k = kwargs.pop("k", kwargs.pop("key", None))
     v = kwargs.pop("v", kwargs.pop("value", None))
@@ -35,7 +34,8 @@ def _sdpa_patched(*args, **kwargs):
 F.scaled_dot_product_attention = _sdpa_patched
 
 from PIL import Image
-# Try I2V first (not available in all builds)
+
+# Prefer I2V when available
 try:
     from diffusers import WanI2VPipeline as _I2VCls
 except Exception:
@@ -43,6 +43,8 @@ except Exception:
 from diffusers import WanPipeline as _T2VCls, AutoencoderKLWan
 from diffusers.utils import export_to_video
 
+# Paths & dtypes
+# ------------------------------------------------------------------
 HF_HOME = os.environ.get('HF_HOME', '/runpod-volume/cache/hf')
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ['HF_HOME'] = HF_HOME
@@ -50,14 +52,12 @@ os.environ['HF_HOME'] = HF_HOME
 MODEL_DIR = os.environ.get('WAN_MODEL_DIR', '/runpod-volume/models/Wan2.2-TI2V-5B-Diffusers')
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# dtype control (bf16 by default; allow override)
 _DTYPE_ENV = os.environ.get('WAN_DTYPE', '').lower()
 if _DTYPE_ENV in ('fp16','float16','half'):
     DTYPE = torch.float16
 elif _DTYPE_ENV in ('fp32','float32'):
     DTYPE = torch.float32
 else:
-    # good default on Ampere+
     DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 DEF_FPS    = int(os.environ.get('WAN_FPS', '24'))
@@ -69,34 +69,23 @@ _T2V = None
 _I2V = None
 
 def _apply_memory_opts(pipe):
-    """
-    Enable memory-saving features; controlled via env when relevant.
-    """
-    # attention/vae slicing are lightweight and help on 16–24GB cards
-    try:
-        pipe.enable_attention_slicing("max")
-    except Exception:
-        pass
-    try:
-        pipe.enable_vae_slicing()
-    except Exception:
-        pass
-    # VAE tiling helps for larger widths/heights
+    """Enable memory-saving features; CPU offload optional via WAN_CPU_OFFLOAD=1."""
+    for fn in ("enable_attention_slicing", "enable_vae_slicing"):
+        try:
+            getattr(pipe, fn)("max") if fn == "enable_attention_slicing" else getattr(pipe, fn)()
+        except Exception:
+            pass
     try:
         pipe.vae.enable_tiling()
     except Exception:
         pass
 
-    # Optional CPU offload (slower but big VRAM saver)
     if os.environ.get("WAN_CPU_OFFLOAD","0") == "1" and torch.cuda.is_available():
         try:
             pipe.enable_model_cpu_offload()
             return pipe
         except Exception:
-            # fallback to .to(DEVICE) if not available
             pass
-
-    # default path: keep on GPU
     try:
         pipe.to(DEVICE)
     except Exception:
@@ -137,9 +126,33 @@ def _file_to_b64(path: str) -> str:
     with open(path, 'rb') as f:
         return base64.b64encode(f.read()).decode('utf-8')
 
+def _maybe_add_extra_kwargs(inp: Dict[str, Any], pipe, kwargs: Dict[str, Any]):
+    """Map optional args only if the current pipeline supports them."""
+    # supported option names we want to pass if present
+    candidates = {
+        # common
+        "strength": float,
+        "image_weight": float,
+        "cond_aug": float,
+        "noise_schedule": str,
+        "seed": int,
+        # Wan-specific
+        "motion_bucket_id": int,
+        "cond_aug_scale": float,
+    }
+    call_vars = getattr(pipe.__call__, "__code__", None)
+    names = set(call_vars.co_varnames if call_vars else ())
+    for k, caster in candidates.items():
+        if k in inp and k in names:
+            try:
+                kwargs[k] = caster(inp[k])
+            except Exception:
+                pass
+
 def handler(event: Dict[str, Any]):
     try:
         inp = (event or {}).get('input') or {}
+        action = (inp.get('action') or '').lower()  # "i2v" or "gen"
         prompt = inp.get('prompt', '')
         width  = int(inp.get('width',  1280))
         height = int(inp.get('height',  704))
@@ -150,17 +163,19 @@ def handler(event: Dict[str, Any]):
         img_b64 = inp.get('image_base64')
         ret_b64 = bool(inp.get('return_video_b64', True))
 
-        # Round dims to multiples of 8 to avoid shape/tiling overhead
+        # round to /8 to be safe with VAE tiling
         width  = int(width // 8 * 8)
         height = int(height // 8 * 8)
 
-        use_i2v = bool(img_b64)
+        # route
+        requested_i2v = (action == "i2v")
+        use_i2v = bool(img_b64) or requested_i2v
         pipe = _load_i2v() if use_i2v else _load_t2v()
         if pipe is None:
             use_i2v = False
             pipe = _load_t2v()
 
-        kwargs = dict(
+        kwargs: Dict[str, Any] = dict(
             prompt=prompt,
             height=height,
             width=width,
@@ -170,7 +185,7 @@ def handler(event: Dict[str, Any]):
         )
         print(
             f"[route] use_i2v={use_i2v} has_img={img_b64 is not None} "
-            f"len_b64={len(img_b64) if img_b64 else 0}",
+            f"len_b64={(len(img_b64) if img_b64 else 0)} action='{action}'",
             flush=True
         )
 
@@ -179,8 +194,6 @@ def handler(event: Dict[str, Any]):
             if pil.mode != "RGB":
                 pil = pil.convert("RGB")
             print(f"[i2v] ref image: {pil.size} mode={pil.mode}", flush=True)
-
-            # аккуратно подбираем имя аргумента, которое принимает текущий пайплайн
             call_vars = getattr(pipe.__call__, "__code__", None)
             names = call_vars.co_varnames if call_vars else ()
             if "image" in names:
@@ -188,15 +201,18 @@ def handler(event: Dict[str, Any]):
             elif "img" in names:
                 kwargs["img"] = pil
             else:
-                kwargs["image"] = pil  # запасной вариант
+                kwargs["image"] = pil
 
+        # add optional kwargs
+        _maybe_add_extra_kwargs(inp, pipe, kwargs)
 
-        # help allocator after multiple runs
+        # free fragmented VRAM
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         with torch.inference_mode():
             result = pipe(**kwargs)
+            # Wan pipelines return
             frames_list = result.frames[0]
 
         os.makedirs('/tmp/out', exist_ok=True)

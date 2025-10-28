@@ -1,10 +1,11 @@
-import os, io, base64, inspect
+import os, io, base64
 from typing import Any, Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# ---- RMSNorm shim (должен стоять ДО импортов diffusers/transformers) ----
+# ---- RMSNorm shim ----
 if not hasattr(nn, "RMSNorm"):
     class _RMSNorm(nn.Module):
         def __init__(self, dim: int, eps: float = 1e-6):
@@ -15,32 +16,25 @@ if not hasattr(nn, "RMSNorm"):
             rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
             return self.weight * (x * rms)
     nn.RMSNorm = _RMSNorm
-# ------------------------------------------------------------------------
 
-# ---- SDPA shim: игнорируем enable_gqa для старых версий torch ----
-import inspect
-import torch.nn.functional as F
-
-if "enable_gqa" not in inspect.signature(F.scaled_dot_product_attention).parameters:
-    _sdpa_orig = F.scaled_dot_product_attention
-    def _sdpa_patched(q, k, v, *args, **kwargs):
-        kwargs.pop("enable_gqa", None)
-        return _sdpa_orig(q, k, v, *args, **kwargs)
-    F.scaled_dot_product_attention = _sdpa_patched
-# ------------------------------------------------------------------
+# ---- SDPA shim: ALWAYS remove unknown kw ----
+_SDPA_ORIG = F.scaled_dot_product_attention
+def _sdpa_patched(q, k, v, *args, **kwargs):
+    # torch <2.3 doesn't know this kw; torch >=2.3 treats it as optional
+    kwargs.pop("enable_gqa", None)
+    return _SDPA_ORIG(q, k, v, *args, **kwargs)
+F.scaled_dot_product_attention = _sdpa_patched
 
 from PIL import Image
 
-# Импорты diffusers после шима
+# Try I2V first, else fall back to T2V
 try:
-    from diffusers import WanI2VPipeline as _I2VCls  # новый класс I2V (если есть)
+    from diffusers import WanI2VPipeline as _I2VCls
 except Exception:
     _I2VCls = None
-
 from diffusers import WanPipeline as _T2VCls, AutoencoderKLWan
 from diffusers.utils import export_to_video
 
-# ---------- ENV / defaults ----------
 HF_HOME = os.environ.get('HF_HOME', '/runpod-volume/cache/hf')
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ['HF_HOME'] = HF_HOME
@@ -50,11 +44,10 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 DTYPE  = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 DEF_FPS    = int(os.environ.get('WAN_FPS', '24'))
-DEF_FRAMES = int(os.environ.get('WAN_FRAMES', '121'))   # ~5s @ 24fps
+DEF_FRAMES = int(os.environ.get('WAN_FRAMES', '121'))
 DEF_STEPS  = int(os.environ.get('WAN_STEPS', '30'))
 DEF_CFG    = float(os.environ.get('WAN_CFG', '5.0'))
 
-# ---------- pipeline singletons ----------
 _T2V = None
 _I2V = None
 
@@ -82,7 +75,6 @@ def _load_i2v():
     _I2V = pipe
     return _I2V
 
-# ---------- helpers ----------
 def _b64_to_pil(b64: str) -> Image.Image:
     data = base64.b64decode(b64)
     return Image.open(io.BytesIO(data)).convert('RGB')
@@ -91,7 +83,6 @@ def _file_to_b64(path: str) -> str:
     with open(path, 'rb') as f:
         return base64.b64encode(f.read()).decode('utf-8')
 
-# ---------- handler ----------
 def handler(event: Dict[str, Any]):
     try:
         inp = (event or {}).get('input') or {}
@@ -122,16 +113,12 @@ def handler(event: Dict[str, Any]):
 
         if use_i2v and img_b64:
             pil = _b64_to_pil(img_b64)
-            sig = inspect.signature(pipe.__call__)
-            image_param_name = None
-            for name in ('image','image_prompt','img','reference_image','ip_adapter_image'):
-                if name in sig.parameters:
-                    image_param_name = name
-                    break
-            if image_param_name is None:
-                use_i2v = False
+            # наиболее типичное имя параметра для I2V
+            if "image" in pipe.__call__.__code__.co_varnames:
+                kwargs["image"] = pil
             else:
-                kwargs[image_param_name] = pil
+                # запасной ключ
+                kwargs["img"] = pil
 
         with torch.inference_mode():
             result = pipe(**kwargs)

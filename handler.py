@@ -168,12 +168,19 @@ def handler(event: Dict[str, Any]):
             guidance_scale=cfg,
             num_inference_steps=steps,
         )
-        print(f"[route] use_i2v={use_i2v} has_img={img_b64 is not None} "
-              f"len_b64={len(img_b64) if img_b64 else 0}", flush=True)
+        print(
+            f"[route] use_i2v={use_i2v} has_img={img_b64 is not None} "
+            f"len_b64={len(img_b64) if img_b64 else 0}",
+            flush=True
+        )
+
         if use_i2v and img_b64:
             pil = _b64_to_pil(img_b64)
+            if pil.mode != "RGB":
+                pil = pil.convert("RGB")
             print(f"[i2v] ref image: {pil.size} mode={pil.mode}", flush=True)
-            # match param name supported by current pipeline
+
+            # аккуратно подбираем имя аргумента, которое принимает текущий пайплайн
             call_vars = getattr(pipe.__call__, "__code__", None)
             names = call_vars.co_varnames if call_vars else ()
             if "image" in names:
@@ -181,7 +188,8 @@ def handler(event: Dict[str, Any]):
             elif "img" in names:
                 kwargs["img"] = pil
             else:
-                kwargs["image"] = pil  # fallback
+                kwargs["image"] = pil  # запасной вариант
+
 
         # help allocator after multiple runs
         if torch.cuda.is_available():

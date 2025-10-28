@@ -1,5 +1,0 @@
-runpod
-pillow
-imageio
-imageio-ffmpeg
-

@@ -27,7 +27,8 @@ WORKDIR /app
 # Torch под CUDA 12.1 + основные либы (numpy<2 для совместимости с py3.8/3.10 образами)
 RUN python3 -m pip install -U pip \
  && python3 -m pip install --no-cache-dir \
-      "torch==2.3.1" "torchvision==0.18.1" --index-url https://download.pytorch.org/whl/cu121 \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    torch==2.4.1 torchvision==0.19.1
  && python3 -m pip install --no-cache-dir \
       "git+https://github.com/huggingface/diffusers" \
       transformers accelerate safetensors pillow "numpy<2" \

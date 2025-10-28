@@ -171,6 +171,7 @@ def handler(event: Dict[str, Any]):
 
         if use_i2v and img_b64:
             pil = _b64_to_pil(img_b64)
+            print(f"[i2v] ref image: {pil.size} mode={pil.mode}")
             # match param name supported by current pipeline
             call_vars = getattr(pipe.__call__, "__code__", None)
             names = call_vars.co_varnames if call_vars else ()
